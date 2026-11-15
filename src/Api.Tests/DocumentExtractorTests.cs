@@ -67,6 +67,70 @@ public class DocumentExtractorTests
         Assert.Equal(DocumentStatus.Valid, r.Status);
         Assert.Equal(106.00m, r.Data!.ExpenseClaim!.Total);
     }
+
+    [Fact]
+    public async Task Max_tokens_goes_to_NeedsReview_without_retry()
+    {
+        var fake = new FakeClaude(FakeClaude.Text(GoodMc, "max_tokens"), FakeClaude.Text(GoodMc));
+        var r = await new DocumentExtractor(fake, Opts).ExtractAsync(Pdf);
+        Assert.Equal(DocumentStatus.NeedsReview, r.Status);
+        Assert.Single(fake.Requests);
+        Assert.Null(r.Data); // a cut-off answer is not trusted, even if it parses
+        Assert.Contains(r.Problems, p => p.Contains("max_tokens"));
+    }
+
+    [Fact]
+    public async Task Stop_reason_on_the_retry_also_goes_to_NeedsReview()
+    {
+        var fake = new FakeClaude(FakeClaude.Text(BadMc), FakeClaude.Text(GoodMc, "max_tokens"));
+        var r = await new DocumentExtractor(fake, Opts).ExtractAsync(Pdf);
+        Assert.Equal(DocumentStatus.NeedsReview, r.Status);
+        Assert.Equal(2, fake.Requests.Count);
+        Assert.Equal(2, r.Attempts);
+    }
+
+    [Fact]
+    public async Task Retry_sends_Claudes_answer_and_the_exact_problems()
+    {
+        var fake = new FakeClaude(FakeClaude.Text(BadMc), FakeClaude.Text(GoodMc));
+        await new DocumentExtractor(fake, Opts).ExtractAsync(Pdf);
+        var answer = FakeClaude.MessageJson(fake.Requests[1], 1);
+        Assert.Equal("assistant", answer.GetProperty("role").GetString());
+        Assert.Contains("\"days\":3", TextOf(answer));
+        var retry = TextOf(FakeClaude.MessageJson(fake.Requests[1], 2));
+        Assert.Contains("days is 3 but the date range is 2 days", retry);
+        Assert.Contains("correct only reading mistakes", retry, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("if the document itself is wrong, keep its values as written", retry, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Not_json_retries_once_with_the_parse_error()
+    {
+        var fake = new FakeClaude(FakeClaude.Text("sorry"), FakeClaude.Text("sorry"), FakeClaude.Text(GoodMc));
+        var r = await new DocumentExtractor(fake, Opts).ExtractAsync(Pdf);
+        Assert.Equal(DocumentStatus.NeedsReview, r.Status);
+        Assert.Equal(2, fake.Requests.Count);
+        Assert.Contains("not valid JSON", TextOf(FakeClaude.MessageJson(fake.Requests[1], 2)));
+    }
+
+    [Fact]
+    public async Task Schema_is_sent_as_json_output_format()
+    {
+        var fake = new FakeClaude(FakeClaude.Text(GoodMc));
+        await new DocumentExtractor(fake, Opts).ExtractAsync(Pdf);
+        var config = System.Text.Json.JsonSerializer.Serialize(fake.Requests[0].OutputConfig);
+        Assert.Contains("medical_certificate", config);
+        Assert.Contains("additionalProperties", config);
+    }
+
+    /// <summary>The text of a message: content is either a string or a list of text blocks.</summary>
+    static string TextOf(System.Text.Json.JsonElement msg)
+    {
+        var content = msg.GetProperty("content");
+        return content.ValueKind == System.Text.Json.JsonValueKind.String
+            ? content.GetString() ?? ""
+            : string.Concat(content.EnumerateArray().Select(b => b.TryGetProperty("text", out var t) ? t.GetString() : ""));
+    }
 }
 
 public class DocumentPdfTests

@@ -13,6 +13,7 @@ public class DocumentExtractor(IClaudeChat claude, ClaudeOptions options)
         Extract the data from this Acme HR document. It is a medical certificate (MC), an expense claim, or something else (kind "other").
         Dates as yyyy-MM-dd. Amounts as numbers without currency symbols. Use null for the part that does not apply.
         Copy values exactly as written. Do not fix or invent numbers.
+        clinic: the clinic's name from the letterhead, including any words in brackets that belong to the letterhead (for example "(synthetic)").
         """;
 
     /// <summary>The JSON schema Claude must follow (structured outputs).</summary>
@@ -64,28 +65,64 @@ public class DocumentExtractor(IClaudeChat claude, ClaudeOptions options)
         },
     };
 
+    /// <summary>Claude reads, C# decides: the schema fixes the shape, DocumentValidator checks the meaning.
+    /// At most MaxAttempts calls; anything still failing goes to a person (NeedsReview).</summary>
     public async Task<ExtractionResult> ExtractAsync(byte[] pdf, CancellationToken ct = default)
     {
         var history = new List<MessageParam> { DocumentMessage(pdf) };
+        Extraction? data = null;
+        List<string> problems = [];
 
-        // TODO (Lab 6): this first version trusts whatever comes back. Make it safe:
-        //  1. Send OutputConfig = new OutputConfig { Format = new JsonOutputFormat { Schema = Schema } }.
-        //  2. Handle a stop_reason other than end_turn: return NeedsReview.
-        //  3. Parse the text into Extraction (catch JsonException) and run DocumentValidator.Check.
-        //  4. If there are problems, retry ONCE: add Claude's answer and the exact problems to history.
-        //     Say "correct only reading mistakes; if the document itself is wrong, keep its values as written".
-        //     Otherwise Claude may "fix" a wrong document (samples 08, 10, 17) so the checks pass.
-        //  5. Still failing, or kind "other": return NeedsReview with the problems. Max MaxAttempts calls.
-        var res = await claude.SendAsync(new MessageCreateParams
+        for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
-            Model = options.Model,
-            MaxTokens = 1024,
-            System = Prompt,
-            Messages = history.ToList(),
-        }, ct);
+            var res = await claude.SendAsync(new MessageCreateParams
+            {
+                Model = options.Model,
+                MaxTokens = 1024,
+                System = Prompt,
+                Messages = history.ToList(),
+                OutputConfig = new OutputConfig { Format = new JsonOutputFormat { Schema = Schema } },
+            }, ct);
 
-        var text = string.Concat(res.Content.Select(b => b.TryPickText(out var t) ? t.Text : ""));
-        var data = JsonSerializer.Deserialize<Extraction>(text);
-        return new ExtractionResult(data, DocumentStatus.Valid, [], 1);
+            // A cut-off or refused answer is not trusted, even if it happens to parse.
+            if (res.StopReason != StopReason.EndTurn)
+                return new ExtractionResult(null, DocumentStatus.NeedsReview,
+                    [$"Claude stopped with {res.StopReason?.Raw() ?? "unknown"}, so the answer may be incomplete"], attempt);
+
+            (data, problems) = Parse(TextOf(res));
+            if (problems.Count == 0) return new ExtractionResult(data, DocumentStatus.Valid, [], attempt);
+            if (data?.Kind == "other") return new ExtractionResult(data, DocumentStatus.NeedsReview, problems, attempt);
+
+            if (attempt < MaxAttempts)
+            {
+                history.Add(new AssistantMessageParam { Content = res.Content.Select(b => new ContentBlockParam(b.Json)).ToList() });
+                history.Add(new UserMessageParam { Content = RetryMessage(problems) });
+            }
+        }
+        return new ExtractionResult(data, DocumentStatus.NeedsReview, problems, MaxAttempts);
     }
+
+    static string TextOf(Message res) => string.Concat(res.Content.Select(b => b.TryPickText(out var t) ? t.Text : ""));
+
+    /// <summary>Parse in C# and run the business rules. Text that is not JSON is a problem, not a crash.</summary>
+    static (Extraction? Data, List<string> Problems) Parse(string text)
+    {
+        try
+        {
+            var data = JsonSerializer.Deserialize<Extraction>(text);
+            return data is null ? (null, ["the answer is not valid JSON: it is empty"]) : (data, DocumentValidator.Check(data));
+        }
+        catch (JsonException e)
+        {
+            return (null, [$"the answer is not valid JSON: {e.Message}"]);
+        }
+    }
+
+    /// <summary>The exact problems, and a rule against "fixing" a document that is wrong on paper (samples 08, 10, 17).</summary>
+    static string RetryMessage(IEnumerable<string> problems) => $"""
+        Your answer has these problems:
+        {string.Join("\n", problems.Select(p => $"- {p}"))}
+        Look at the document again. Correct only reading mistakes; if the document itself is wrong, keep its values as written.
+        Return the full JSON again.
+        """;
 }
