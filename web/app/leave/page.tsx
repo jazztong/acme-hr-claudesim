@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
-import { api, Balance, currentEmployee, LeaveRequest } from "@/lib/api";
+import { api, Balance, clashWarning, currentEmployee, getClashes, LeaveRequest } from "@/lib/api";
 
 export default function Leave() {
   const [rows, setRows] = useState<LeaveRequest[]>([]);
@@ -26,7 +26,14 @@ export default function Leave() {
   }
   async function decide(id: number, action: "approve" | "reject") {
     setError("");
-    try { await api(`/leave/${id}/${action}`, { method: "POST" }); load(); } catch (err) { setError((err as Error).message); }
+    try {
+      // Warn before approving if two or more teammates are already off; the manager still decides.
+      if (action === "approve") {
+        const warning = clashWarning(await getClashes(id));
+        if (warning && !window.confirm(warning)) return;
+      }
+      await api(`/leave/${id}/${action}`, { method: "POST" }); load();
+    } catch (err) { setError((err as Error).message); }
   }
 
   return (

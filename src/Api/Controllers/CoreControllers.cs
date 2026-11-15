@@ -68,6 +68,17 @@ public class LeaveController(LeaveService leave, AccessService access) : Control
     public Task<IActionResult> Create(NewLeave body) =>
         Run(() => leave.CreateAsync(new CreateLeave(User.EmployeeId(), body.StartDate!.Value, body.EndDate!.Value, body.HalfDay, body.Reason)));
 
+    /// <summary>Days on which two or more teammates are already off. Only someone who may approve this request may see it.</summary>
+    [HttpGet("{id:int}/clashes")]
+    public async Task<IActionResult> Clashes(int id)
+    {
+        var request = await leave.FindAsync(id);
+        if (request is null) return Problem(statusCode: 404, title: $"Leave request {id} not found");
+        if (!await access.CanDecideLeaveAsync(User, request))
+            return Problem(statusCode: 403, title: "Only the employee's manager or HR can see who else is off");
+        return Ok(new { requestId = id, clashes = await leave.GetClashesAsync(request) });
+    }
+
     [HttpPost("{id:int}/approve")]
     public Task<IActionResult> Approve(int id) => Decide(id, () => leave.ApproveAsync(id));
 
