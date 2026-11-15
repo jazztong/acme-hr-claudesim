@@ -29,6 +29,19 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 export type Employee = { id: number; name: string; email: string; department: string; managerId: number | null; annualEntitlement: number; roles?: string[] };
 export type LeaveRequest = { id: number; employeeId: number; startDate: string; endDate: string; halfDay: "None" | "AM" | "PM"; days: number; status: "Pending" | "Approved" | "Rejected"; reason: string };
 export type Balance = { employeeId: number; entitlement: number; used: number; pending: number; available: number };
+export type LeaveClash = { date: string; peopleOff: string[] };
+
+/** Days on which two or more teammates are already off (only the request's manager or HR may ask). */
+export async function getClashes(id: number): Promise<LeaveClash[]> {
+  return (await api<{ requestId: number; clashes: LeaveClash[] }>(`/leave/${id}/clashes`)).clashes;
+}
+
+/** The text of the warning shown before approving, or "" when nobody clashes. */
+export function clashWarning(clashes: LeaveClash[]): string {
+  if (clashes.length === 0) return "";
+  const lines = clashes.map(c => `${c.date}: ${c.peopleOff.join(", ")}`);
+  return `Two or more people in the team are already off:\n${lines.join("\n")}\n\nApprove anyway?`;
+}
 
 // Sign-in: email + password against the API's built-in ASP.NET Core Identity endpoints.
 // The bearer token and the signed-in employee are kept in this browser only.

@@ -6,6 +6,8 @@ namespace Api.Services;
 
 public record LeaveBalance(int EmployeeId, decimal Entitlement, decimal Used, decimal Pending, decimal Available);
 public record CreateLeave(int EmployeeId, DateOnly StartDate, DateOnly EndDate, HalfDay HalfDay = HalfDay.None, string Reason = "");
+/// <summary>A working day of a request on which ClashThreshold or more teammates already have Approved leave.</summary>
+public record LeaveClash(DateOnly Date, IReadOnlyList<string> PeopleOff);
 
 public class LeaveException(string message) : Exception(message);
 
@@ -68,6 +70,33 @@ public class LeaveService(AcmeDb db)
     }
 
     public async Task<LeaveRequest?> FindAsync(int id) => await db.LeaveRequests.FindAsync(id);
+
+    /// <summary>A day clashes when this many teammates are already off.</summary>
+    public const int ClashThreshold = 2;
+
+    /// <summary>Working days of the request on which ClashThreshold or more teammates (same manager, not the requester)
+    /// already have Approved leave. A half day counts as off. A warning only: approving is still allowed.</summary>
+    public async Task<List<LeaveClash>> GetClashesAsync(LeaveRequest request)
+    {
+        var managerId = await db.Employees.Where(e => e.Id == request.EmployeeId).Select(e => e.ManagerId).FirstOrDefaultAsync();
+        if (managerId is null) return [];
+
+        var teamOff = await db.LeaveRequests
+            .Where(r => r.Status == LeaveStatus.Approved && r.EmployeeId != request.EmployeeId
+                && r.StartDate <= request.EndDate && r.EndDate >= request.StartDate)
+            .Join(db.Employees.Where(e => e.ManagerId == managerId), r => r.EmployeeId, e => e.Id,
+                (r, e) => new { r.StartDate, r.EndDate, e.Name })
+            .ToListAsync();
+
+        var clashes = new List<LeaveClash>();
+        for (var day = request.StartDate; day <= request.EndDate; day = day.AddDays(1))
+        {
+            if (!WorkingDays.IsWorkingDay(day)) continue;
+            var off = teamOff.Where(t => t.StartDate <= day && day <= t.EndDate).Select(t => t.Name).Distinct().ToList();
+            if (off.Count >= ClashThreshold) clashes.Add(new LeaveClash(day, off));
+        }
+        return clashes;
+    }
 
     public Task<LeaveRequest> ApproveAsync(int id) => DecideAsync(id, LeaveStatus.Approved);
     public Task<LeaveRequest> RejectAsync(int id) => DecideAsync(id, LeaveStatus.Rejected);
